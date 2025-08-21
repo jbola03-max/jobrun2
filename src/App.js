@@ -1,180 +1,791 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { supabase } from './supabaseClient';
 import Auth from './Auth';
+import './index.css';
 
-function App() {
+export default function App() {
+  // Session & UI
   const [session, setSession] = useState(null);
+  const [msg, setMsg] = useState('');
+  const [mode, setMode] = useState(localStorage.getItem('mode') || 'customer'); // customer | driver
+
+  // Admin (UI-only gating by email)
+  const ADMIN_EMAIL =
+    process.env.REACT_APP_ADMIN_EMAIL ||
+    (typeof import.meta !== 'undefined' ? import.meta.env?.VITE_ADMIN_EMAIL : undefined) ||
+    'jbola.03@gmail.com';
+  const isAdmin = session?.user?.email?.toLowerCase() === ADMIN_EMAIL.toLowerCase();
+
+  // Profiles
+  const [myProfile, setMyProfile] = useState(null);
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [availableDrivers, setAvailableDrivers] = useState(0);
+  const [profilesById, setProfilesById] = useState({});
+
+  // Orders
   const [orders, setOrders] = useState([]);
-  const [mode, setMode] = useState(localStorage.getItem('mode') || 'customer');
-  const [statusFilter, setStatusFilter] = useState('pending');
-  const [message, setMessage] = useState('');
+  const [filter, setFilter] = useState('active'); // active | completed | void | all
+  const [uploading, setUploading] = useState(false);
 
-  const isAdmin = session?.user?.email?.endsWith('@admin.com');
+  // Create order form
+  const [address, setAddress] = useState('');
+  const [contact, setContact] = useState('');
+  const [orderNotes, setOrderNotes] = useState('');
+  const [items, setItems] = useState([{ item_name: '', quantity: 1, notes: '' }]);
+  const [imageFile, setImageFile] = useState(null);
+  const [imagePreview, setImagePreview] = useState(null);
 
+  // Modal
+  const [openOrderId, setOpenOrderId] = useState(null);
+
+  // Chat
+  const [messagesByOrder, setMessagesByOrder] = useState({});
+  const [draftByOrder, setDraftByOrder] = useState({});
+  const [loadingMsgs, setLoadingMsgs] = useState({});
+
+  // Time window
+  const startOfTodayISO = useMemo(() => { const d = new Date(); d.setHours(0,0,0,0); return d.toISOString(); }, []);
+  const ACTIVE = ['pending','accepted','item_purchased','on_the_way'];
+
+  // Effects: auth
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-    });
-
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
-      setSession(session);
-    });
-
+    supabase.auth.getSession().then(({ data: { session } }) => setSession(session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
     return () => listener.subscription.unsubscribe();
   }, []);
 
+  // Effects: profile, drivers
+  useEffect(() => { if (session) { loadMyProfile(); countAvailableDrivers(); } }, [session]);
+
+  // Effects: fetch orders
+  useEffect(() => { if (session) fetchOrders(); }, [session, mode, startOfTodayISO]);
+
+  // Realtime: orders
   useEffect(() => {
     if (!session) return;
-    fetchOrders();
-  }, [session, mode, statusFilter]);
+    const notifyAndRefresh = (payload) => {
+      const oldS = payload.old?.status, newS = payload.new?.status;
+      if (oldS && newS && oldS !== newS) toast(`🔔 ${pretty(oldS)} → ${pretty(newS)}`);
+      else if (payload.eventType === 'INSERT') toast('🆕 New order');
+      else if (payload.eventType === 'DELETE') toast('🗑️ Order deleted');
+      else if (payload.eventType === 'UPDATE') {
+        const n = payload.new;
+        if (n?.eta_window_start && n?.eta_window_end) toast('⏱️ ETA updated');
+      }
+      fetchOrders();
+    };
+    const chCustomer = supabase
+      .channel(`orders-user-${session.user.id}`)
+      .on('postgres_changes', { event:'*', schema:'public', table:'orders', filter:`user_id=eq.${session.user.id}` }, notifyAndRefresh)
+      .subscribe();
+    const chDriver = supabase
+      .channel(`orders-driver-${session.user.id}`)
+      .on('postgres_changes', { event:'*', schema:'public', table:'orders', filter:`accepted_by=eq.${session.user.id}` }, notifyAndRefresh)
+      .subscribe();
+    return () => { supabase.removeChannel(chCustomer); supabase.removeChannel(chDriver); };
+  }, [session]);
 
-  const fetchOrders = async () => {
-    let query = supabase
+  // Realtime: messages
+  useEffect(() => {
+    if (!session) return;
+    const onMessageInsert = (payload) => {
+      const m = payload.new; if (!m?.order_id) return;
+      setMessagesByOrder(prev => {
+        const list = prev[m.order_id] ? [...prev[m.order_id], m] : [m];
+        return { ...prev, [m.order_id]: list };
+      });
+      if (m.sender_id !== session.user.id) toast('💬 New message');
+    };
+    const chMsgs = supabase
+      .channel(`msgs-${session.user.id}`)
+      .on('postgres_changes', { event:'INSERT', schema:'public', table:'messages' }, onMessageInsert)
+      .subscribe();
+    return () => { supabase.removeChannel(chMsgs); };
+  }, [session]);
+
+  // Utils
+  function toast(t){ setMsg(t); setTimeout(()=>setMsg(''), 3000); }
+  function pretty(s){ return (s || '').replace(/_/g,' '); }
+  function isAUPhone(s){ const x = s.replace(/\s+/g,''); return /^(\+614\d{8}|04\d{8}|0[2378]\d{8}|1[38]00\d{6})$/.test(x); }
+  function etaLabel(o) {
+    try {
+      if (!o.eta_window_start || !o.eta_window_end) return null;
+      const opts = { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'Australia/Sydney' };
+      const s = new Date(o.eta_window_start).toLocaleTimeString('en-AU', opts);
+      const e = new Date(o.eta_window_end).toLocaleTimeString('en-AU', opts);
+      return `${s}–${e}`;
+    } catch { return null; }
+  }
+
+  // Profiles
+  async function loadMyProfile() {
+    const { data, error } = await supabase.from('user_profiles').select('*').eq('id', session.user.id).maybeSingle();
+    if (error) return toast('❌ ' + error.message);
+    if (!data) {
+      const init = { id: session.user.id, display_name: session.user.email.split('@')[0], role: 'customer', is_available: false, avatar_url: null };
+      const { error: insErr } = await supabase.from('user_profiles').insert([init]);
+      if (insErr) return toast('❌ ' + insErr.message);
+      setMyProfile(init);
+    } else setMyProfile(data);
+  }
+  async function saveProfile({ display_name, role, is_available }) {
+    setSavingProfile(true);
+    const patch = { display_name: display_name ?? myProfile?.display_name ?? '', role: role ?? myProfile?.role ?? 'customer', is_available: !!(is_available ?? myProfile?.is_available) };
+    const { data, error } = await supabase.from('user_profiles').update(patch).eq('id', session.user.id).select().maybeSingle();
+    setSavingProfile(false);
+    if (error) return toast('❌ ' + error.message);
+    setMyProfile(data); toast('✅ Profile saved'); countAvailableDrivers();
+  }
+  async function uploadAvatar(file) {
+    if (!file) return;
+    const ext = file.name.split('.').pop();
+    const path = `${session.user.id}/${Date.now()}.${ext}`;
+    const up = await supabase.storage.from('avatars').upload(path, file);
+    if (up.error) return toast('❌ ' + up.error.message);
+    const { data: url } = supabase.storage.from('avatars').getPublicUrl(path);
+    const { error: updErr } = await supabase.from('user_profiles').update({ avatar_url: url.publicUrl }).eq('id', session.user.id);
+    if (updErr) return toast('❌ ' + updErr.message);
+    setMyProfile(p => ({ ...p, avatar_url: url.publicUrl })); toast('✅ Avatar updated');
+  }
+  async function countAvailableDrivers(){
+    const { count, error } = await supabase
+      .from('user_profiles')
+      .select('*', { count:'exact', head:true })
+      .eq('role', 'driver').eq('is_available', true);
+    if (!error) setAvailableDrivers(count || 0);
+  }
+
+  // Orders
+  async function fetchOrders() {
+    let q = supabase
       .from('orders')
-      .select(`*, order_items ( item_name, quantity, notes )`)
+      .select('*, order_items ( item_name, quantity, notes )')
+      .gte('created_at', startOfTodayISO)
       .order('created_at', { ascending: false });
-
     if (!isAdmin) {
-      if (mode === 'customer') query = query.eq('user_id', session.user.id);
-      if (mode === 'driver') query = query.eq('accepted_by', session.user.id);
+      if (mode === 'customer') q = q.eq('user_id', session.user.id);
+      else if (mode === 'driver') q = q.or(`accepted_by.eq.${session.user.id},accepted_by.is.null`);
     }
+    const { data, error } = await q;
+    if (error) return toast('❌ ' + error.message);
+    setOrders(data || []); await loadProfilesForOrders(data || []);
+  }
+  async function loadProfilesForOrders(list) {
+    const ids = new Set(); list.forEach(o => { if (o.user_id) ids.add(o.user_id); if (o.accepted_by) ids.add(o.accepted_by); });
+    if (ids.size === 0) return;
+    const { data } = await supabase.from('user_profiles').select('id, display_name, avatar_url, role, is_available').in('id', Array.from(ids));
+    const map = {}; (data || []).forEach(p => map[p.id] = p); setProfilesById(map);
+  }
+  async function uploadImage(orderId, file) {
+    if (!file) return; setUploading(true);
+    const ext = file.name.split('.').pop();
+    const path = `${orderId}/${Date.now()}.${ext}`;
+    const { error: upErr } = await supabase.storage.from('screenshots').upload(path, file);
+    if (upErr) { setUploading(false); return toast('❌ ' + upErr.message); }
+    const { data: url } = supabase.storage.from('screenshots').getPublicUrl(path);
+    const { error: updErr } = await supabase.from('orders').update({ image_url: url.publicUrl }).eq('id', orderId);
+    setUploading(false);
+    if (updErr) return toast('❌ ' + updErr.message);
+    toast('✅ Image uploaded'); fetchOrders();
+  }
+  async function deleteOrder(id) {
+    if (!isAdmin && mode !== 'customer') return toast('❌ Drivers cannot delete orders');
+    if (!window.confirm('Delete this order?')) return;
+    if (!isAdmin) {
+      const { data: ord, error } = await supabase.from('orders').select('user_id,status').eq('id', id).single();
+      if (error) return toast('❌ ' + error.message);
+      if (ord.user_id !== session.user.id) return toast('❌ Not your order');
+      if (ord.status !== 'pending') return toast('❌ Only pending orders can be deleted');
+    }
+    const { error: delErr } = await supabase.from('orders').delete().eq('id', id);
+    if (delErr) return toast('❌ ' + delErr.message);
+    toast('✅ Order deleted'); setOrders(prev => prev.filter(o => o.id !== id));
+  }
+  async function updateOrderStatus(id, status) {
+    const { error } = await supabase.from('orders').update({ status }).eq('id', id);
+    if (error) return toast('❌ ' + error.message);
+    toast('✅ Status updated'); fetchOrders();
+  }
+  async function acceptOrder(id) {
+    if (myProfile?.role !== 'driver') return toast('❌ Set your profile role to Driver first.');
+    if (!myProfile?.is_available) return toast('❌ Toggle “Available” in your profile to accept jobs.');
+    const { error } = await supabase
+      .from('orders')
+      .update({ accepted_by: session.user.id, status: 'accepted' })
+      .eq('id', id).eq('status','pending').is('accepted_by', null);
+    if (error) return toast('❌ ' + error.message);
+    toast('✅ Order accepted'); fetchOrders();
+  }
 
-    query = query.eq('status', statusFilter);
-    const { data } = await query;
-    if (data) setOrders(data);
-  };
+  // ETA window
+  async function setEta(orderId, minutes) {
+    if (!minutes && minutes !== 0) return;
+    const mins = parseInt(minutes, 10);
+    if (Number.isNaN(mins) || mins < 0 || mins > 720) return toast('❌ ETA must be 0–720 minutes');
+    const now = new Date();
+    const center = new Date(now.getTime() + mins * 60 * 1000);
+    const start = new Date(center.getTime() - 5 * 60 * 1000);
+    const end = new Date(center.getTime() + 5 * 60 * 1000);
+    const { error } = await supabase.from('orders').update({
+      eta_minutes: mins, eta_window_start: start.toISOString(), eta_window_end: end.toISOString()
+    }).eq('id', orderId);
+    if (error) return toast('❌ ' + error.message);
+    toast('✅ ETA window updated'); fetchOrders();
+  }
 
-  const handleSetMode = (m) => {
-    setMode(m);
-    localStorage.setItem('mode', m);
-    setStatusFilter('pending');
-  };
+  // Void flow
+  async function requestVoid(orderId) {
+    const reason = window.prompt('Enter reason to request void:');
+    if (!reason) return;
+    const order = orders.find(o => o.id === orderId);
+    if (!order || order.accepted_by !== session.user.id) return toast('❌ Accept the job before requesting a void');
+    const { error } = await supabase.from('orders').update({
+      void_requested_at: new Date().toISOString(), void_reason: reason
+    }).eq('id', orderId);
+    if (error) return toast('❌ ' + error.message);
+    toast('✅ Void requested — waiting for customer'); fetchOrders();
+  }
+  async function confirmVoid(orderId) {
+    if (!window.confirm('Confirm void?')) return;
+    const { error } = await supabase.from('orders').update({ status: 'void' }).eq('id', orderId);
+    if (error) return toast('❌ ' + error.message);
+    toast('✅ Order voided'); fetchOrders();
+  }
+  async function cancelVoid(orderId) {
+    const { error } = await supabase.from('orders').update({ void_requested_at: null, void_reason: null }).eq('id', orderId);
+    if (error) return toast('❌ ' + error.message);
+    toast('✅ Kept order active'); fetchOrders();
+  }
 
-  const showMessage = (msg) => {
-    setMessage(msg);
-    setTimeout(() => setMessage(''), 3000);
-  };
+  // Create order helpers
+  const updateItem = (idx, patch) => setItems(items.map((it,i)=> i===idx ? { ...it, ...patch } : it));
+  const removeItem = (idx) => { if (items.length === 1) return; setItems(items.filter((_,i)=>i!==idx)); };
+  const addItem = () => setItems(prev => [...prev, { item_name:'', quantity:1, notes:'' }]);
 
-  const deleteOrder = async (id) => {
-    const { error } = await supabase.from('orders').delete().eq('id', id);
-    if (error) return showMessage('❌ ' + error.message);
-    showMessage('✅ Order deleted');
-    setOrders(prev => prev.filter(o => o.id !== id));
-  };
+  async function submitOrder() {
+    if (!address.trim()) return toast('❌ Delivery address required');
+    if (!contact.trim() || !isAUPhone(contact)) return toast('❌ Valid AU contact number required');
 
-  const updateOrderStatus = async (id, newStatus) => {
-    const { error } = await supabase.from('orders').update({ status: newStatus }).eq('id', id);
-    if (error) return showMessage('❌ ' + error.message);
-    showMessage('✅ Status updated');
-    fetchOrders();
-  };
+    const cleanItems = items
+      .map(it => ({ ...it, item_name:(it.item_name||'').trim(), quantity: parseInt(it.quantity,10)||1, notes:(it.notes||'').trim() }))
+      .filter(it => it.item_name && it.quantity>0);
+    if (!cleanItems.length) return toast('❌ Add at least one item');
 
-  if (!session) return <Auth onAuth={() => window.location.reload()} />;
+    const { data: orderData, error: orderErr } = await supabase.from('orders').insert([{
+      user_id: session.user.id,
+      status:'pending',
+      delivery_address: address.trim(),
+      contact_number: contact.trim(),
+      ai_notes: orderNotes.trim()
+    }]).select();
+    if (orderErr) return toast('❌ ' + orderErr.message);
+    const orderId = orderData[0].id;
+
+    const rows = cleanItems.map(it => ({ order_id: orderId, item_name: it.item_name, quantity: it.quantity, notes: it.notes }));
+    const { error: itemErr } = await supabase.from('order_items').insert(rows);
+    if (itemErr) return toast('❌ ' + itemErr.message);
+
+    if (imageFile) await uploadImage(orderId, imageFile);
+
+    // Reset
+    setAddress(''); setContact(''); setOrderNotes('');
+    setItems([{ item_name:'', quantity:1, notes:'' }]); setImageFile(null); setImagePreview(null);
+    toast('✅ Order created'); fetchOrders();
+  }
+
+  // Admin purge via RPC
+  async function purgeOlderThanToday() {
+    if (!isAdmin) return toast('❌ Admin only');
+    if (!window.confirm('Purge ALL orders created before today? This cannot be undone.')) return;
+    const { data, error } = await supabase.rpc('purge_old_orders');
+    if (error) return toast('❌ ' + error.message);
+    toast(`✅ Purged ${data || 0} old orders`); fetchOrders();
+  }
+
+  // Derived lists
+  if (!session) {
+    return (
+      <div className="min-h-screen grid place-items-center p-6">
+        <Auth onAuth={() => window.location.reload()} />
+      </div>
+    );
+  }
+  const activeOrders = orders.filter(o => ACTIVE.includes(o.status));
+  const completedOrders = orders.filter(o => o.status === 'delivered');
+  const voidOrders = orders.filter(o => o.status === 'void');
+
+  let filteredOrders = orders;
+  if (filter==='active') filteredOrders = activeOrders;
+  if (filter==='completed') filteredOrders = completedOrders;
+  if (filter==='void') filteredOrders = voidOrders;
 
   return (
-    <div style={{ padding: '2rem' }}>
-      <h1>Bunnings Delivery</h1>
-      <p>Logged in as: <code>{session.user.email}</code></p>
-      <button onClick={() => supabase.auth.signOut()}>Logout</button>
-
-      <div style={{ marginTop: '1rem' }}>
-        <strong>Mode:</strong>
-        <button onClick={() => handleSetMode('customer')} disabled={mode === 'customer'}>Customer</button>
-        <button onClick={() => handleSetMode('driver')} disabled={mode === 'driver'} style={{ marginLeft: '1rem' }}>Driver</button>
-      </div>
-
-      <div style={{ marginTop: '1rem' }}>
-        <strong>Status:</strong>
-        {['pending', 'accepted', 'delivered'].map(status => (
-          <button key={status} onClick={() => setStatusFilter(status)} disabled={statusFilter === status} style={{ marginLeft: '1rem' }}>
-            {status.charAt(0).toUpperCase() + status.slice(1)}
-          </button>
-        ))}
-      </div>
-
-      {message && <div style={{ background: '#ddf', padding: '1rem', marginTop: '1rem' }}>{message}</div>}
-
-      {mode === 'customer' && statusFilter === 'pending' && (
-        <>
-          <h3 style={{ marginTop: '2rem' }}>Create New Order</h3>
-          <form onSubmit={async (e) => {
-            e.preventDefault();
-            const form = e.target;
-            const { address, itemName, quantity, notes } = form.elements;
-
-            const { data: orderData, error: orderError } = await supabase.from('orders').insert([{
-              user_id: session.user.id,
-              status: 'pending',
-              delivery_address: address.value,
-              ai_notes: notes.value
-            }]).select();
-
-            if (orderError) return showMessage('❌ ' + orderError.message);
-
-            const orderId = orderData[0].id;
-            const { error: itemError } = await supabase.from('order_items').insert([{
-              order_id: orderId,
-              item_name: itemName.value,
-              quantity: parseInt(quantity.value),
-              notes: notes.value
-            }]);
-
-            if (itemError) return showMessage('❌ ' + itemError.message);
-
-            showMessage('✅ Order created');
-            form.reset();
-            fetchOrders();
-          }}>
-            <input name="address" placeholder="Delivery address" required /><br /><br />
-            <input name="itemName" placeholder="Item name" required /><br /><br />
-            <input name="quantity" type="number" placeholder="Quantity" defaultValue="1" required /><br /><br />
-            <textarea name="notes" placeholder="Any notes" /><br /><br />
-            <button type="submit">Submit Order</button>
-          </form>
-        </>
-      )}
-
-      <h3 style={{ marginTop: '2rem' }}>{isAdmin ? 'All Orders' : 'Orders'}</h3>
-      {orders.length === 0 ? <p>No orders.</p> : orders.map(order => (
-        <div key={order.id} style={{ border: '1px solid #ccc', padding: '1rem', marginBottom: '1rem' }}>
-          <p><strong>Status:</strong> {order.status}</p>
-          <p><strong>Address:</strong> {order.delivery_address}</p>
-          <p><strong>Notes:</strong> {order.ai_notes}</p>
-          {order.order_items?.map((item, i) => (
-            <div key={i}><em>🛒 {item.quantity}x {item.item_name}</em> {item.notes && `– ${item.notes}`}</div>
-          ))}
-
-          {(mode === 'driver' && statusFilter === 'pending') && (
-            <button onClick={async () => {
-              const { error } = await supabase
-                .from('orders')
-                .update({ accepted_by: session.user.id, status: 'accepted' })
-                .eq('id', order.id)
-                .eq('status', 'pending')
-                .is('accepted_by', null);
-              if (error) return showMessage('❌ ' + error.message);
-              showMessage('✅ Order accepted!');
-              fetchOrders();
-            }}>Accept</button>
-          )}
-
-          {(mode === 'driver' && statusFilter === 'accepted') && (
-            <button onClick={() => updateOrderStatus(order.id, 'delivered')}>Mark Delivered</button>
-          )}
-
-          {isAdmin && (
-            <select defaultValue={order.status} onChange={(e) => updateOrderStatus(order.id, e.target.value)}>
-              <option value="pending">Pending</option>
-              <option value="accepted">Accepted</option>
-              <option value="delivered">Delivered</option>
-            </select>
-          )}
-
-          {(order.status === 'pending' || isAdmin) && <button onClick={() => deleteOrder(order.id)} style={{ marginLeft: '1rem' }}>Delete</button>}
+    <div className="min-h-screen bg-gray-950 text-slate-100">
+      {/* Header */}
+      <header className="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/70 backdrop-blur">
+        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="text-xl font-bold">JobRun — Bunnings Delivery</div>
+            <span className="badge">Today</span>
+            <span className="badge">Drivers online: {availableDrivers}</span>
+          </div>
+          <div className="flex items-center gap-3 text-sm">
+            <span className="text-slate-400">Signed in as <code>{session.user.email}</code></span>
+            <button className="btn btn-danger" onClick={() => supabase.auth.signOut()}>Logout</button>
+          </div>
         </div>
-      ))}
+      </header>
+
+      {/* Content */}
+      <main className="max-w-6xl mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Left: Profile & Controls & Create */}
+        <aside className="space-y-6">
+          <div className="card p-4">
+            <ProfileCard
+              session={session}
+              myProfile={myProfile}
+              onSave={saveProfile}
+              onAvatar={uploadAvatar}
+              saving={savingProfile}
+            />
+          </div>
+
+          <div className="card p-4 space-y-4">
+            {/* Mode */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-slate-300 font-medium">Mode:</span>
+              <button className="btn" onClick={() => { setMode('customer'); localStorage.setItem('mode','customer'); }} disabled={mode==='customer'}>Customer</button>
+              <button className="btn" onClick={() => { setMode('driver'); localStorage.setItem('mode','driver'); }} disabled={mode==='driver'}>Driver</button>
+            </div>
+            {/* Filter */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-slate-300 font-medium">Filter:</span>
+              <button className="btn" onClick={() => setFilter('active')} disabled={filter==='active'}>Active ({activeOrders.length})</button>
+              <button className="btn" onClick={() => setFilter('completed')} disabled={filter==='completed'}>Completed ({completedOrders.length})</button>
+              <button className="btn" onClick={() => setFilter('void')} disabled={filter==='void'}>Voided ({voidOrders.length})</button>
+              <button className="btn" onClick={() => setFilter('all')} disabled={filter==='all'}>All ({orders.length})</button>
+            </div>
+
+            {isAdmin && (
+              <button className="btn btn-danger w-full" onClick={purgeOlderThanToday}>
+                Admin: Purge orders before today
+              </button>
+            )}
+          </div>
+
+          {msg && <div className="toast">{msg}</div>}
+
+          {mode === 'customer' && (
+            <div className="card p-4 space-y-4">
+              <h3 className="text-lg font-semibold">Create New Order</h3>
+              <input className="input" value={address} onChange={(e)=>setAddress(e.target.value)} placeholder="Delivery address" />
+              <input className="input" value={contact} onChange={(e)=>setContact(e.target.value)} placeholder="Site contact number (AU)" onBlur={()=>{ if (contact && !isAUPhone(contact)) toast('❌ Valid AU phone e.g. 04xx xxx xxx'); }} />
+              <textarea className="input" value={orderNotes} onChange={(e)=>setOrderNotes(e.target.value)} placeholder="Order notes (optional)" />
+
+              <div>
+                <div className="font-medium text-slate-200">Items</div>
+                {items.map((it, idx) => (
+                  <div key={idx} className="mt-2 grid grid-cols-6 gap-2">
+                    <input className="input col-span-3" value={it.item_name} onChange={(e)=>updateItem(idx,{ item_name: e.target.value })} placeholder="Item name" />
+                    <input className="input col-span-1" type="number" min="1" value={it.quantity}
+                      onChange={(e)=>updateItem(idx,{ quantity: Math.max(1, parseInt(e.target.value||'1',10)) })} placeholder="Qty" />
+                    <input className="input col-span-2" value={it.notes} onChange={(e)=>updateItem(idx,{ notes: e.target.value })} placeholder="Notes (SKU, color…)" />
+                    <div className="col-span-6">
+                      <button className="btn" onClick={()=>removeItem(idx)} disabled={items.length===1}>Remove</button>
+                    </div>
+                  </div>
+                ))}
+                <button className="btn mt-2" onClick={addItem}>+ Add another item</button>
+              </div>
+
+              <div>
+                <div className="font-medium text-slate-200">Screenshot (optional)</div>
+                <div className="flex items-center gap-3 mt-2">
+                  <input type="file" accept="image/*" onChange={(e)=>{
+                    const f = e.target.files?.[0] || null; setImageFile(f);
+                    if (f) { const r=new FileReader(); r.onload=()=>setImagePreview(r.result); r.readAsDataURL(f); } else setImagePreview(null);
+                  }} />
+                  {imagePreview && <img src={imagePreview} alt="preview" className="h-20 rounded-lg border border-slate-800" />}
+                </div>
+              </div>
+
+              <button className="btn btn-primary" onClick={submitOrder} disabled={uploading}>
+                {uploading ? 'Uploading…' : 'Submit Order'}
+              </button>
+            </div>
+          )}
+        </aside>
+
+        {/* Right: Orders list */}
+        <section className="lg:col-span-2 space-y-3">
+          <h3 className="text-lg font-semibold">Orders (Today)</h3>
+
+          {filteredOrders.length === 0 ? (
+            <p className="text-sm text-slate-400">No orders match the current filter.</p>
+          ) : filteredOrders.map(order => {
+            const driver = order.accepted_by ? profilesById[order.accepted_by] : null;
+            return (
+              <div key={order.id} className="card p-4">
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="badge">{pretty(order.status)}</span>
+                      {order.accepted_by && <span className="badge">Driver: {driver?.display_name || 'Driver'}</span>}
+                      {etaLabel(order) && ACTIVE.includes(order.status) && (
+                        <span className="badge">ETA {etaLabel(order)}</span>
+                      )}
+                    </div>
+                    <div className="text-sm text-slate-300 mt-1 truncate">
+                      {order.delivery_address} • {order.contact_number}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {mode==='driver' && order.status==='pending' && (
+                      <button
+                        className="btn btn-primary"
+                        onClick={()=>acceptOrder(order.id)}
+                        disabled={myProfile?.role!=='driver' || !myProfile?.is_available}
+                      >
+                        Accept
+                      </button>
+                    )}
+                    <button className="btn" onClick={()=>openDetails(order.id, loadMessages)}>View</button>
+                    {((mode==='customer' && order.status==='pending') || isAdmin) && (
+                      <button className="btn" onClick={()=>deleteOrder(order.id)}>Delete</button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </section>
+      </main>
+
+      {/* Modal */}
+      {openOrderId && (
+        <OrderModal
+          order={orders.find(o=>o.id===openOrderId)}
+          profilesById={profilesById}
+          session={session}
+          mode={mode}
+          setEta={setEta}
+          updateOrderStatus={updateOrderStatus}
+          requestVoid={requestVoid}
+          confirmVoid={confirmVoid}
+          cancelVoid={cancelVoid}
+          uploadImage={uploadImage}
+          messages={messagesByOrder[openOrderId] || []}
+          loading={!!loadingMsgs[openOrderId]}
+          draft={draftByOrder[openOrderId] || ''}
+          setDraft={(v)=>setDraftByOrder(p=>({ ...p, [openOrderId]: v }))}
+          loadMessages={()=>loadMessages(openOrderId)}
+          sendMessage={()=>sendMessage(openOrderId)}
+          quickSend={(t)=>quickSend(openOrderId, t)}
+          close={()=>setOpenOrderId(null)}
+        />
+      )}
+    </div>
+  );
+
+  // Helpers in component scope
+  async function openDetails(id, loader){ setOpenOrderId(id); await loader(id); }
+  async function loadMessages(orderId) {
+    setLoadingMsgs(p => ({ ...p, [orderId]: true }));
+    const { data, error } = await supabase.from('messages').select('*').eq('order_id', orderId).order('created_at', { ascending:true });
+    setLoadingMsgs(p => ({ ...p, [orderId]: false }));
+    if (error) return toast('❌ ' + error.message);
+    setMessagesByOrder(p => ({ ...p, [orderId]: data || [] }));
+  }
+  async function sendMessage(orderId) {
+    const body = (draftByOrder[orderId] || '').trim(); if (!body) return;
+    const { error } = await supabase.from('messages').insert([{ order_id: orderId, sender_id: session.user.id, body }]);
+    if (error) return toast('❌ ' + error.message);
+    setDraftByOrder(p => ({ ...p, [orderId]: '' })); await loadMessages(orderId);
+  }
+  async function quickSend(orderId, text) { setDraftByOrder(p => ({ ...p, [orderId]: text })); await sendMessage(orderId); }
+}
+
+/* ===== Small components ===== */
+
+function OrderTimeline({ status }) {
+  const STATUSES = ['pending','accepted','item_purchased','on_the_way','delivered'];
+  const idx = status === 'void' ? -1 : STATUSES.indexOf(status);
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      {STATUSES.map((s,i)=>{
+        const done = idx > i, current = idx === i;
+        return (
+          <div key={s} className="flex items-center gap-2">
+            <div
+              title={s.replace(/_/g,' ')}
+              className={`w-4 h-4 rounded-full border-2 border-slate-600 ${done ? 'bg-emerald-400/40' : current ? 'bg-amber-300/40' : 'bg-slate-900'}`}
+            />
+            <small className="capitalize text-slate-300">{s.replace(/_/g,' ')}</small>
+            {i < STATUSES.length-1 && <div className="w-7 h-0.5 bg-slate-700" />}
+          </div>
+        );
+      })}
+      {status==='void' && <span className="badge">void</span>}
     </div>
   );
 }
 
-export default App;
+function EtaEditor({ order, onSet }) {
+  const [val, setVal] = useState(order.eta_minutes ?? '');
+  return (
+    <div className="flex items-center gap-2">
+      <input className="input w-36" type="number" min="0" max="720" value={val} onChange={(e)=>setVal(e.target.value)} placeholder="ETA (min)" />
+      <button className="btn" onClick={()=>onSet(val)}>Set ETA</button>
+    </div>
+  );
+}
+
+function Avatar({ url, size = 36 }) {
+  return url
+    ? <img src={url} alt="" style={{ width:size, height:size, borderRadius:size }} className="border border-slate-800 object-cover" />
+    : <div style={{ width:size, height:size, borderRadius:size }} className="border border-slate-800 bg-slate-900" />;
+}
+
+function ProfileCard({ session, myProfile, onSave, onAvatar, saving }) {
+  const [name, setName] = useState(myProfile?.display_name || '');
+  const [role, setRole] = useState(myProfile?.role || 'customer');
+  const [avail, setAvail] = useState(!!myProfile?.is_available);
+
+  useEffect(()=>{ setName(myProfile?.display_name||''); setRole(myProfile?.role||'customer'); setAvail(!!myProfile?.is_available); },[myProfile]);
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-3">
+        <Avatar url={myProfile?.avatar_url} />
+        <div>
+          <div className="font-semibold">{name || 'Your Profile'}</div>
+          <div className="text-xs text-slate-400">Email: {session.user.email}</div>
+        </div>
+      </div>
+      <div className="grid gap-2">
+        <input className="input" value={name} onChange={(e)=>setName(e.target.value)} placeholder="Display name" />
+        <select className="input" value={role} onChange={(e)=>setRole(e.target.value)}>
+          <option value="customer">Customer</option>
+          <option value="driver">Driver</option>
+          <option value="admin">Admin</option>
+        </select>
+        {role==='driver' && (
+          <label className="text-sm text-slate-300 inline-flex items-center gap-2">
+            <input type="checkbox" checked={avail} onChange={(e)=>setAvail(e.target.checked)} />
+            Available
+          </label>
+        )}
+        <button className="btn btn-primary" disabled={saving} onClick={()=>onSave({ display_name: name, role, is_available: avail })}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        <div>
+          <input type="file" accept="image/*" onChange={(e)=> onAvatar(e.target.files?.[0])} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SectionTitle({ children }) {
+  return <h4 className="text-base font-semibold">{children}</h4>;
+}
+
+function OrderModal(props) {
+  const {
+    order, profilesById, session, mode,
+    setEta, updateOrderStatus, requestVoid, confirmVoid, cancelVoid,
+    uploadImage, messages, loading, draft, setDraft, loadMessages, sendMessage, quickSend,
+    close
+  } = props;
+
+  if (!order) return null;
+
+  const driver = order.accepted_by ? profilesById[order.accepted_by] : null;
+  const customer = order.user_id ? profilesById[order.user_id] : null;
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50" onClick={close}>
+      <div className="card w-full max-w-3xl p-4" onClick={(e)=>e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-3">
+          <OrderTimeline status={order.status} />
+          <button className="btn" onClick={close}>Close</button>
+        </div>
+
+        <div className="grid gap-3">
+          {/* Chips */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="badge">Status: {order.status.replace(/_/g,' ')}</span>
+            {order.eta_window_start && order.eta_window_end && (
+              <span className="badge">ETA {formatEta(order)}</span>
+            )}
+            {driver && <span className="badge">Driver: {driver.display_name || 'Driver'}</span>}
+            {customer && <span className="badge">Customer: {customer.display_name || 'Customer'}</span>}
+          </div>
+
+          {/* Details */}
+          <div className="grid md:grid-cols-2 gap-3">
+            <div className="card p-3">
+              <SectionTitle>Job Details</SectionTitle>
+              <div className="text-sm text-slate-300 mt-1">Address</div>
+              <div>{order.delivery_address}</div>
+              <div className="text-sm text-slate-300 mt-2">Contact</div>
+              <div>{order.contact_number}</div>
+              {order.ai_notes && (
+                <>
+                  <div className="text-sm text-slate-300 mt-2">Notes</div>
+                  <div>{order.ai_notes}</div>
+                </>
+              )}
+            </div>
+
+            <div className="card p-3">
+              <SectionTitle>People</SectionTitle>
+              <div className="flex items-center gap-4 mt-2">
+                {driver && (
+                  <div className="flex items-center gap-2">
+                    <Avatar url={driver.avatar_url} />
+                    <div className="text-sm">Driver: <strong>{driver.display_name || 'Driver'}</strong></div>
+                  </div>
+                )}
+                {customer && (
+                  <div className="flex items-center gap-2">
+                    <Avatar url={customer.avatar_url} />
+                    <div className="text-sm">Customer: <strong>{customer.display_name || 'Customer'}</strong></div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Items & Image */}
+          <div className="grid md:grid-cols-2 gap-3">
+            <div className="card p-3">
+              <SectionTitle>Items</SectionTitle>
+              {order.order_items?.length ? (
+                <ul className="list-disc pl-5 mt-2">
+                  {order.order_items.map((it,i)=>(
+                    <li key={i}>🛒 {it.quantity}× {it.item_name}{it.notes ? ` — ${it.notes}` : ''}</li>
+                  ))}
+                </ul>
+              ) : <div className="text-sm text-slate-400">No items.</div>}
+            </div>
+
+            <div className="card p-3">
+              <SectionTitle>Screenshot</SectionTitle>
+              {order.image_url
+                ? <img src={order.image_url} alt="uploaded" className="rounded-lg border border-slate-800 max-h-64" />
+                : <div className="text-sm text-slate-400">No image uploaded.</div>}
+              {mode==='customer' && (
+                <div className="mt-3">
+                  <input type="file" accept="image/*" onChange={async (e)=>{
+                    const f = e.target.files?.[0]; if (f) await uploadImage(order.id, f);
+                  }} />
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Driver actions */}
+          {mode==='driver' && (
+            <div className="card p-3">
+              <SectionTitle>Driver Actions</SectionTitle>
+              <div className="flex flex-wrap gap-2 mt-2">
+                {order.status==='pending' && <span className="text-sm text-slate-400">Accept from the list.</span>}
+                {order.status==='accepted' && (
+                  <>
+                    <button className="btn btn-warn" onClick={()=>updateOrderStatus(order.id,'item_purchased')}>Item Purchased</button>
+                    <EtaEditor order={order} onSet={(mins)=>setEta(order.id, mins)} />
+                  </>
+                )}
+                {order.status==='item_purchased' && (
+                  <>
+                    <button className="btn btn-warn" onClick={()=>updateOrderStatus(order.id,'on_the_way')}>On the Way</button>
+                    <EtaEditor order={order} onSet={(mins)=>setEta(order.id, mins)} />
+                  </>
+                )}
+                {order.status==='on_the_way' && (
+                  <>
+                    <button className="btn btn-primary" onClick={()=>updateOrderStatus(order.id,'delivered')}>Mark Delivered</button>
+                    <EtaEditor order={order} onSet={(mins)=>setEta(order.id, mins)} />
+                  </>
+                )}
+                {['accepted','item_purchased','on_the_way'].includes(order.status) && (
+                  order.void_requested_at
+                    ? <span className="badge">Void requested — waiting for customer</span>
+                    : <button className="btn" onClick={()=>requestVoid(order.id)}>Request Void</button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Customer: void decision */}
+          {mode==='customer' && order.void_requested_at && order.status!=='void' && (
+            <div className="card p-3">
+              <SectionTitle>Void Request</SectionTitle>
+              {order.void_reason && <div className="mb-2">Reason: {order.void_reason}</div>}
+              <div className="flex gap-2">
+                <button className="btn btn-danger" onClick={()=>confirmVoid(order.id)}>Confirm Void</button>
+                <button className="btn" onClick={()=>cancelVoid(order.id)}>Keep Order</button>
+              </div>
+            </div>
+          )}
+
+          {/* Chat */}
+          <div className="card p-3">
+            <SectionTitle>Messages</SectionTitle>
+            <div className="mt-2 space-y-2">
+              {loading ? (
+                <p className="text-sm text-slate-400">Loading messages…</p>
+              ) : messages.length ? (
+                <div className="space-y-2 max-h-64 overflow-auto pr-1">
+                  {messages.map(m => {
+                    const sender = profilesById[m.sender_id];
+                    const name = m.sender_id === session.user.id ? 'You' : (sender?.display_name || 'Other');
+                    return (
+                      <div key={m.id}>
+                        <div className="text-xs text-slate-400">
+                          <strong>{name}:</strong> {new Date(m.created_at).toLocaleString()}
+                        </div>
+                        <div>{m.body}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="text-sm text-slate-400">No messages yet.</p>
+              )}
+
+              <div className="flex gap-2">
+                <input className="input flex-1" value={draft} onChange={(e)=>setDraft(e.target.value)}
+                  placeholder={mode==='driver' ? 'Ask a question or send an update…' : 'Send a message to your driver…'} />
+                <button className="btn btn-primary" onClick={sendMessage}>Send</button>
+              </div>
+
+              {mode==='driver' && (
+                <div className="flex flex-wrap gap-2">
+                  <button className="btn" onClick={()=>quickSend('Hi! I have accepted your job 👍')}>Accepted 👍</button>
+                  <button className="btn" onClick={()=>quickSend('Item has been purchased ✅')}>Purchased ✅</button>
+                  <button className="btn" onClick={()=>quickSend('On the way. ETA ~20 minutes 🕒')}>ETA 20m 🕒</button>
+                  <button className="btn" onClick={()=>quickSend('Delivered. Thanks! 📦')}>Delivered 📦</button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 mt-3">
+          <button className="btn" onClick={close}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  function formatEta(o){
+    try {
+      const opts = { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'Australia/Sydney' };
+      const s = new Date(o.eta_window_start).toLocaleTimeString('en-AU', opts);
+      const e = new Date(o.eta_window_end).toLocaleTimeString('en-AU', opts);
+      return `${s}–${e}`;
+    } catch { return null; }
+  }
+}
