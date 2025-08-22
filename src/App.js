@@ -971,6 +971,8 @@ function OrderModal(props) {
                   <button className="btn" onClick={()=>quickSend('Delivered. Thanks! 📦')}>Delivered 📦</button>
                 </div>
               )}
+             {/* preview sanity marker */}
++              <div style={{ fontSize: 12, opacity: 0.6 }}>preview test</div>
             </div> {/* end Chat inner */}
           </div>   {/* end Chat card */}
         </div>     {/* end grid gap-3 */}
