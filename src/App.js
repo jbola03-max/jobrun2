@@ -599,8 +599,12 @@ async function loadMessages(orderId) {
   setMessagesByOrder(p => ({ ...p, [orderId]: data || [] }));
 }
 
-async function sendMessage(orderId) {
-  const body = (draftByOrder[orderId] || '').trim();
+/**
+ * Send a message for an order.
+ * If bodyOverride is provided, it is used directly (fixes stale-state issues).
+ */
+async function sendMessage(orderId, bodyOverride) {
+  const body = (bodyOverride ?? draftByOrder[orderId] ?? '').trim();
   if (!body) return;
 
   // prevent double-submit for this order
@@ -608,19 +612,28 @@ async function sendMessage(orderId) {
   sendingRef.current.add(orderId);
 
   try {
+    // ensure we have an authenticated user for RLS-friendly insert
+    const { data: { session } = {} } = await supabase.auth.getSession();
     const uid = session?.user?.id;
     if (!uid) {
       toast('❌ Not authenticated');
       return;
     }
+
     const { error } = await supabase
       .from('messages')
       .insert([{ order_id: orderId, sender_id: uid, body }]); // RLS-friendly
+
     if (error) {
       toast('❌ ' + error.message);
       return;
     }
-    setDraftByOrder(p => ({ ...p, [orderId]: '' }));
+
+    // clear draft only if we were sending from the draft box
+    if (bodyOverride == null) {
+      setDraftByOrder(p => ({ ...p, [orderId]: '' }));
+    }
+
     await loadMessages(orderId);
   } finally {
     // always clear the in-flight flag
@@ -629,12 +642,15 @@ async function sendMessage(orderId) {
 }
 
 async function quickSend(orderId, text) {
-  // reuse the same guard so quick actions can't double-fire
+  // don’t queue another if one is in-flight
   if (sendingRef.current.has(orderId)) return;
-  setDraftByOrder(p => ({ ...p, [orderId]: text }));
-  await sendMessage(orderId);
-}
 
+  // (optional) reflect in UI draft if you like:
+  setDraftByOrder(p => ({ ...p, [orderId]: text }));
+
+  // send using the override to avoid stale state
+  await sendMessage(orderId, text);
+}
 
 /* ===== Small components ===== */
 
