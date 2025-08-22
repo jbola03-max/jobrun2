@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useRef } from 'react';
 import { supabase } from './supabaseClient';
 import Auth from './Auth';
 import './index.css';
@@ -43,6 +43,7 @@ export default function App() {
   const [messagesByOrder, setMessagesByOrder] = useState({});
   const [draftByOrder, setDraftByOrder] = useState({});
   const [loadingMsgs, setLoadingMsgs] = useState({});
+  const [sending, setSending] = useState(false);
 
   // Time window
   const startOfTodayISO = useMemo(() => { const d = new Date(); d.setHours(0,0,0,0); return d.toISOString(); }, []);
@@ -577,22 +578,63 @@ export default function App() {
   );
 
   // Helpers in component scope
-  async function openDetails(id, loader){ setOpenOrderId(id); await loader(id); }
-  async function loadMessages(orderId) {
-    setLoadingMsgs(p => ({ ...p, [orderId]: true }));
-    const { data, error } = await supabase.from('messages').select('*').eq('order_id', orderId).order('created_at', { ascending:true });
-    setLoadingMsgs(p => ({ ...p, [orderId]: false }));
-    if (error) return toast('❌ ' + error.message);
-    setMessagesByOrder(p => ({ ...p, [orderId]: data || [] }));
-  }
-  async function sendMessage(orderId) {
-    const body = (draftByOrder[orderId] || '').trim(); if (!body) return;
-    const { error } = await supabase.from('messages').insert([{ order_id: orderId, sender_id: session.user.id, body }]);
-    if (error) return toast('❌ ' + error.message);
-    setDraftByOrder(p => ({ ...p, [orderId]: '' })); await loadMessages(orderId);
-  }
-  async function quickSend(orderId, text) { setDraftByOrder(p => ({ ...p, [orderId]: text })); await sendMessage(orderId); }
+
+// prevents double-submit per orderId without adding UI state
+const sendingRef = useRef(new Set()); // Set<orderId>
+
+async function openDetails(id, loader) {
+  setOpenOrderId(id);
+  await loader(id);
 }
+
+async function loadMessages(orderId) {
+  setLoadingMsgs(p => ({ ...p, [orderId]: true }));
+  const { data, error } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('order_id', orderId)
+    .order('created_at', { ascending: true });
+  setLoadingMsgs(p => ({ ...p, [orderId]: false }));
+  if (error) return toast('❌ ' + error.message);
+  setMessagesByOrder(p => ({ ...p, [orderId]: data || [] }));
+}
+
+async function sendMessage(orderId) {
+  const body = (draftByOrder[orderId] || '').trim();
+  if (!body) return;
+
+  // prevent double-submit for this order
+  if (sendingRef.current.has(orderId)) return;
+  sendingRef.current.add(orderId);
+
+  try {
+    const uid = session?.user?.id;
+    if (!uid) {
+      toast('❌ Not authenticated');
+      return;
+    }
+    const { error } = await supabase
+      .from('messages')
+      .insert([{ order_id: orderId, sender_id: uid, body }]); // RLS-friendly
+    if (error) {
+      toast('❌ ' + error.message);
+      return;
+    }
+    setDraftByOrder(p => ({ ...p, [orderId]: '' }));
+    await loadMessages(orderId);
+  } finally {
+    // always clear the in-flight flag
+    sendingRef.current.delete(orderId);
+  }
+}
+
+async function quickSend(orderId, text) {
+  // reuse the same guard so quick actions can't double-fire
+  if (sendingRef.current.has(orderId)) return;
+  setDraftByOrder(p => ({ ...p, [orderId]: text }));
+  await sendMessage(orderId);
+}
+
 
 /* ===== Small components ===== */
 
