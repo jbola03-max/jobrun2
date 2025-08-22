@@ -581,6 +581,39 @@ export default function App() {
 
 // prevents double-submit per orderId without adding UI state
 const sendingRef = useRef(new Set()); // Set<orderId>
+// avoid duplicate subscriptions in React Strict Mode
+const channelRef = useRef(null);
+
+useEffect(() => {
+  if (!openOrderId) return;
+
+  // clean up any previous channel before re-subscribing
+  if (channelRef.current) {
+    supabase.removeChannel(channelRef.current);
+    channelRef.current = null;
+  }
+
+  const channel = supabase
+    .channel(`messages-${openOrderId}`)
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'messages', filter: `order_id=eq.${openOrderId}` },
+      () => {
+        // refresh messages whenever this order’s rows change
+        loadMessages(openOrderId);
+      }
+    )
+    .subscribe();
+
+  channelRef.current = channel;
+
+  return () => {
+    if (channelRef.current) {
+      supabase.removeChannel(channelRef.current);
+      channelRef.current = null;
+    }
+  };
+}, [openOrderId]); // re-run when you open a different order
 
 async function openDetails(id, loader) {
   setOpenOrderId(id);
