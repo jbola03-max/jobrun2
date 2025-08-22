@@ -25,6 +25,7 @@ export default function App() {
   // Orders
   const [orders, setOrders] = useState([]);
   const [filter, setFilter] = useState('active'); // active | completed | void | all
+  const [search, setSearch] = useState('');
   const [uploading, setUploading] = useState(false);
 
   // Create order form
@@ -103,6 +104,28 @@ export default function App() {
     return () => { supabase.removeChannel(chMsgs); };
   }, [session]);
 
+  // Deep-linking: open modal if URL hash is an order id
+  useEffect(() => {
+    const openFromHash = async () => {
+      const id = (window.location.hash || '').replace('#', '');
+      if (!id) return;
+      // If orders not loaded yet, wait a tick
+      const exists = orders.find(o => o.id === id);
+      if (exists) {
+        setOpenOrderId(id);
+        await loadMessages(id);
+      }
+    };
+    openFromHash();
+    const onHash = () => {
+      const id = (window.location.hash || '').replace('#', '');
+      if (id) { setOpenOrderId(id); loadMessages(id); }
+      else { setOpenOrderId(null); }
+    };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, [orders]);
+
   // Utils
   function toast(t){ setMsg(t); setTimeout(()=>setMsg(''), 3000); }
   function pretty(s){ return (s || '').replace(/_/g,' '); }
@@ -115,6 +138,11 @@ export default function App() {
       const e = new Date(o.eta_window_end).toLocaleTimeString('en-AU', opts);
       return `${s}–${e}`;
     } catch { return null; }
+  }
+  function mapsUrl(addr){ return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr||'')}`; }
+  async function copy(text){
+    try { await navigator.clipboard.writeText(text||''); toast('📋 Copied'); }
+    catch { toast('❌ Could not copy'); }
   }
 
   // Profiles
@@ -188,6 +216,21 @@ export default function App() {
     if (updErr) return toast('❌ ' + updErr.message);
     toast('✅ Image uploaded'); fetchOrders();
   }
+
+  // Proof of delivery
+  async function uploadPOD(orderId, file) {
+    if (!file) return; setUploading(true);
+    const ext = file.name.split('.').pop();
+    const path = `pod/${orderId}/${Date.now()}.${ext}`;
+    const { error: upErr } = await supabase.storage.from('screenshots').upload(path, file);
+    if (upErr) { setUploading(false); return toast('❌ ' + upErr.message); }
+    const { data: url } = supabase.storage.from('screenshots').getPublicUrl(path);
+    const { error: updErr } = await supabase.from('orders').update({ pod_image_url: url.publicUrl }).eq('id', orderId);
+    setUploading(false);
+    if (updErr) return toast('❌ ' + updErr.message);
+    toast('✅ Proof photo uploaded'); fetchOrders();
+  }
+
   async function deleteOrder(id) {
     if (!isAdmin && mode !== 'customer') return toast('❌ Drivers cannot delete orders');
     if (!window.confirm('Delete this order?')) return;
@@ -201,14 +244,21 @@ export default function App() {
     if (delErr) return toast('❌ ' + delErr.message);
     toast('✅ Order deleted'); setOrders(prev => prev.filter(o => o.id !== id));
   }
-  async function updateOrderStatus(id, status) {
-    const { error } = await supabase.from('orders').update({ status }).eq('id', id);
-    if (error) return toast('❌ ' + error.message);
-    toast('✅ Status updated'); fetchOrders();
-  }
+   async function updateOrderStatus(id, status) {
+  const { error } = await supabase.from('orders').update({ status }).eq('id', id);
+  if (error) return toast('❌ ' + error.message);
+  toast('✅ Status updated'); fetchOrders();
+}
+
+
+  // Client-side guard: one active job per driver
   async function acceptOrder(id) {
     if (myProfile?.role !== 'driver') return toast('❌ Set your profile role to Driver first.');
     if (!myProfile?.is_available) return toast('❌ Toggle “Available” in your profile to accept jobs.');
+    const iHaveActive = orders.some(o =>
+      o.accepted_by === session.user.id && ['accepted','item_purchased','on_the_way'].includes(o.status)
+    );
+    if (iHaveActive) return toast('❌ You already have an active job. Complete or void it first.');
     const { error } = await supabase
       .from('orders')
       .update({ accepted_by: session.user.id, status: 'accepted' })
@@ -319,6 +369,20 @@ export default function App() {
   if (filter==='completed') filteredOrders = completedOrders;
   if (filter==='void') filteredOrders = voidOrders;
 
+  // Search (address/contact/notes/items)
+  const q = search.trim().toLowerCase();
+  if (q) {
+    filteredOrders = filteredOrders.filter(o => {
+      const fields = [
+        o.delivery_address || '',
+        o.contact_number || '',
+        o.ai_notes || '',
+        (o.order_items || []).map(i => i.item_name).join(' ')
+      ].join(' ').toLowerCase();
+      return fields.includes(q);
+    });
+  }
+
   return (
     <div className="min-h-screen bg-gray-950 text-slate-100">
       {/* Header */}
@@ -328,6 +392,7 @@ export default function App() {
             <div className="text-xl font-bold">JobRun — Bunnings Delivery</div>
             <span className="badge">Today</span>
             <span className="badge">Drivers online: {availableDrivers}</span>
+            {myProfile?.role && <span className="badge">You: {myProfile.role}</span>}
           </div>
           <div className="flex items-center gap-3 text-sm">
             <span className="text-slate-400">Signed in as <code>{session.user.email}</code></span>
@@ -366,6 +431,7 @@ export default function App() {
               <button className="btn" onClick={() => setFilter('all')} disabled={filter==='all'}>All ({orders.length})</button>
             </div>
 
+            {/* Admin purge */}
             {isAdmin && (
               <button className="btn btn-danger w-full" onClick={purgeOlderThanToday}>
                 Admin: Purge orders before today
@@ -418,10 +484,20 @@ export default function App() {
 
         {/* Right: Orders list */}
         <section className="lg:col-span-2 space-y-3">
-          <h3 className="text-lg font-semibold">Orders (Today)</h3>
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-lg font-semibold">Orders (Today)</h3>
+            <input
+              className="input w-72"
+              placeholder="Search address, contact, items…"
+              value={search}
+              onChange={(e)=>setSearch(e.target.value)}
+            />
+          </div>
 
           {filteredOrders.length === 0 ? (
-            <p className="text-sm text-slate-400">No orders match the current filter.</p>
+            <div className="card p-6 text-sm text-slate-400">
+              No orders match the current filter. Create one in <strong>Customer</strong> mode or adjust the filter/search.
+            </div>
           ) : filteredOrders.map(order => {
             const driver = order.accepted_by ? profilesById[order.accepted_by] : null;
             return (
@@ -434,22 +510,34 @@ export default function App() {
                       {etaLabel(order) && ACTIVE.includes(order.status) && (
                         <span className="badge">ETA {etaLabel(order)}</span>
                       )}
+                      {order.pod_image_url && <span className="badge">POD ✓</span>}
                     </div>
                     <div className="text-sm text-slate-300 mt-1 truncate">
                       {order.delivery_address} • {order.contact_number}
                     </div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
+                    {/* Open in Maps + copy address */}
+                    <a className="btn" href={mapsUrl(order.delivery_address)} target="_blank" rel="noreferrer">Open in Maps</a>
+                    <button className="btn" onClick={()=>copy(order.delivery_address)}>Copy address</button>
+
                     {mode==='driver' && order.status==='pending' && (
                       <button
                         className="btn btn-primary"
                         onClick={()=>acceptOrder(order.id)}
                         disabled={myProfile?.role!=='driver' || !myProfile?.is_available}
+                        title={myProfile?.role!=='driver' ? 'Set role to Driver' : (!myProfile?.is_available ? 'Toggle Available in your profile' : 'Accept')}
                       >
                         Accept
                       </button>
                     )}
-                    <button className="btn" onClick={()=>openDetails(order.id, loadMessages)}>View</button>
+                    <button
+                      className="btn"
+                      onClick={()=>{ setOpenOrderId(order.id); loadMessages(order.id); window.location.hash = order.id; }}
+                      title="View details"
+                    >
+                      View
+                    </button>
                     {((mode==='customer' && order.status==='pending') || isAdmin) && (
                       <button className="btn" onClick={()=>deleteOrder(order.id)}>Delete</button>
                     )}
@@ -474,6 +562,7 @@ export default function App() {
           confirmVoid={confirmVoid}
           cancelVoid={cancelVoid}
           uploadImage={uploadImage}
+          uploadPOD={uploadPOD}
           messages={messagesByOrder[openOrderId] || []}
           loading={!!loadingMsgs[openOrderId]}
           draft={draftByOrder[openOrderId] || ''}
@@ -481,7 +570,7 @@ export default function App() {
           loadMessages={()=>loadMessages(openOrderId)}
           sendMessage={()=>sendMessage(openOrderId)}
           quickSend={(t)=>quickSend(openOrderId, t)}
-          close={()=>setOpenOrderId(null)}
+          close={()=>{ setOpenOrderId(null); if (window.location.hash) window.location.hash=''; }}
         />
       )}
     </div>
@@ -594,17 +683,35 @@ function OrderModal(props) {
   const {
     order, profilesById, session, mode,
     setEta, updateOrderStatus, requestVoid, confirmVoid, cancelVoid,
-    uploadImage, messages, loading, draft, setDraft, loadMessages, sendMessage, quickSend,
+    uploadImage, uploadPOD, messages, loading, draft, setDraft, loadMessages, sendMessage, quickSend,
     close
   } = props;
+
+  // Hooks MUST be before any early returns
+  const [pendingShot, setPendingShot] = useState(null);
+  const [pendingPod, setPendingPod] = useState(null);
+  const [uploadingShot, setUploadingShot] = useState(false);
+  const [uploadingPod, setUploadingPod] = useState(false);
 
   if (!order) return null;
 
   const driver = order.accepted_by ? profilesById[order.accepted_by] : null;
   const customer = order.user_id ? profilesById[order.user_id] : null;
 
+  function formatEta(o){
+    try {
+      const opts = { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'Australia/Sydney' };
+      const s = new Date(o.eta_window_start).toLocaleTimeString('en-AU', opts);
+      const e = new Date(o.eta_window_end).toLocaleTimeString('en-AU', opts);
+      return `${s}–${e}`;
+    } catch { return null; }
+  }
+
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50" onClick={close}>
+    <div
+      className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50"
+      onClick={close}
+    >
       <div className="card w-full max-w-3xl p-4" onClick={(e)=>e.stopPropagation()}>
         <div className="flex items-center justify-between mb-3">
           <OrderTimeline status={order.status} />
@@ -620,6 +727,7 @@ function OrderModal(props) {
             )}
             {driver && <span className="badge">Driver: {driver.display_name || 'Driver'}</span>}
             {customer && <span className="badge">Customer: {customer.display_name || 'Customer'}</span>}
+            {order.pod_image_url && <span className="badge">POD ✓</span>}
           </div>
 
           {/* Details */}
@@ -627,7 +735,18 @@ function OrderModal(props) {
             <div className="card p-3">
               <SectionTitle>Job Details</SectionTitle>
               <div className="text-sm text-slate-300 mt-1">Address</div>
-              <div>{order.delivery_address}</div>
+              <div className="flex items-center gap-2">
+                <span>{order.delivery_address}</span>
+                <a
+                  className="btn"
+                  href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(order.delivery_address||'')}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Open in Maps
+                </a>
+                <button className="btn" onClick={()=>navigator.clipboard.writeText(order.delivery_address||'')}>Copy</button>
+              </div>
               <div className="text-sm text-slate-300 mt-2">Contact</div>
               <div>{order.contact_number}</div>
               {order.ai_notes && (
@@ -657,7 +776,7 @@ function OrderModal(props) {
             </div>
           </div>
 
-          {/* Items & Image */}
+          {/* Items & Images */}
           <div className="grid md:grid-cols-2 gap-3">
             <div className="card p-3">
               <SectionTitle>Items</SectionTitle>
@@ -667,21 +786,94 @@ function OrderModal(props) {
                     <li key={i}>🛒 {it.quantity}× {it.item_name}{it.notes ? ` — ${it.notes}` : ''}</li>
                   ))}
                 </ul>
-              ) : <div className="text-sm text-slate-400">No items.</div>}
+              ) : (
+                <div className="text-sm text-slate-400">No items.</div>
+              )}
             </div>
 
-            <div className="card p-3">
-              <SectionTitle>Screenshot</SectionTitle>
-              {order.image_url
-                ? <img src={order.image_url} alt="uploaded" className="rounded-lg border border-slate-800 max-h-64" />
-                : <div className="text-sm text-slate-400">No image uploaded.</div>}
-              {mode==='customer' && (
-                <div className="mt-3">
-                  <input type="file" accept="image/*" onChange={async (e)=>{
-                    const f = e.target.files?.[0]; if (f) await uploadImage(order.id, f);
-                  }} />
+            <div className="card p-3 space-y-2">
+              <SectionTitle>Images</SectionTitle>
+              <div className="grid grid-cols-2 gap-2">
+                {/* Customer screenshot */}
+                <div>
+                  <div className="text-xs text-slate-400 mb-1">Customer screenshot</div>
+                  {order.image_url
+                    ? <img src={order.image_url} alt="uploaded" className="rounded-lg border border-slate-800 max-h-56" />
+                    : <div className="text-sm text-slate-400">No screenshot.</div>}
+
+                  {mode==='customer' && (
+                    <div className="mt-2 space-y-2">
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={(e)=> setPendingShot(e.target.files?.[0] || null)}
+                      />
+                      {pendingShot && (
+                        <div className="flex items-center gap-2">
+                          <img
+                            src={URL.createObjectURL(pendingShot)}
+                            alt="preview"
+                            className="h-16 rounded border border-slate-800 object-cover"
+                          />
+                          <button
+                            className="btn btn-primary"
+                            disabled={uploadingShot}
+                            onClick={async ()=>{
+                              setUploadingShot(true);
+                              await uploadImage(order.id, pendingShot);
+                              setUploadingShot(false);
+                              setPendingShot(null);
+                            }}
+                          >
+                            {uploadingShot ? 'Uploading…' : 'Upload'}
+                          </button>
+                          <button className="btn" onClick={()=>setPendingShot(null)}>Cancel</button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
-              )}
+
+                {/* Proof of delivery */}
+                <div>
+                  <div className="text-xs text-slate-400 mb-1">Proof of delivery (driver)</div>
+                  {order.pod_image_url
+                    ? <img src={order.pod_image_url} alt="pod" className="rounded-lg border border-slate-800 max-h-56" />
+                    : <div className="text-sm text-slate-400">No proof uploaded.</div>}
+
+                  {mode==='driver' && (
+                    <div className="mt-2 space-y-2">
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={(e)=> setPendingPod(e.target.files?.[0] || null)}
+                      />
+                      {pendingPod && (
+                        <div className="flex items-center gap-2">
+                          <img
+                            src={URL.createObjectURL(pendingPod)}
+                            alt="preview"
+                            className="h-16 rounded border border-slate-800 object-cover"
+                          />
+                          <button
+                            className="btn btn-primary"
+                            disabled={uploadingPod}
+                            onClick={async ()=>{
+                              setUploadingPod(true);
+                              await uploadPOD(order.id, pendingPod);
+                              setUploadingPod(false);
+                              setPendingPod(null);
+                            }}
+                          >
+                            {uploadingPod ? 'Uploading…' : 'Upload'}
+                          </button>
+                          <button className="btn" onClick={()=>setPendingPod(null)}>Cancel</button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
 
@@ -705,7 +897,13 @@ function OrderModal(props) {
                 )}
                 {order.status==='on_the_way' && (
                   <>
-                    <button className="btn btn-primary" onClick={()=>updateOrderStatus(order.id,'delivered')}>Mark Delivered</button>
+                    <button
+                      className="btn btn-primary"
+                      onClick={()=>updateOrderStatus(order.id,'delivered')}
+                      title="Mark as delivered"
+                    >
+                      Mark Delivered
+                    </button>
                     <EtaEditor order={order} onSet={(mins)=>setEta(order.id, mins)} />
                   </>
                 )}
@@ -756,8 +954,12 @@ function OrderModal(props) {
               )}
 
               <div className="flex gap-2">
-                <input className="input flex-1" value={draft} onChange={(e)=>setDraft(e.target.value)}
-                  placeholder={mode==='driver' ? 'Ask a question or send an update…' : 'Send a message to your driver…'} />
+                <input
+                  className="input flex-1"
+                  value={draft}
+                  onChange={(e)=>setDraft(e.target.value)}
+                  placeholder={mode==='driver' ? 'Ask a question or send an update…' : 'Send a message to your driver…'}
+                />
                 <button className="btn btn-primary" onClick={sendMessage}>Send</button>
               </div>
 
@@ -769,23 +971,14 @@ function OrderModal(props) {
                   <button className="btn" onClick={()=>quickSend('Delivered. Thanks! 📦')}>Delivered 📦</button>
                 </div>
               )}
-            </div>
-          </div>
-        </div>
-
-        <div className="flex items-center justify-end gap-2 mt-3">
-          <button className="btn" onClick={close}>Close</button>
-        </div>
-      </div>
+            </div> {/* end Chat inner */}
+          </div>   {/* end Chat card */}
+        </div>     {/* end grid gap-3 */}
+      </div>       {/* end modal inner card */}
+      {/* end overlay */}
     </div>
   );
-
-  function formatEta(o){
-    try {
-      const opts = { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'Australia/Sydney' };
-      const s = new Date(o.eta_window_start).toLocaleTimeString('en-AU', opts);
-      const e = new Date(o.eta_window_end).toLocaleTimeString('en-AU', opts);
-      return `${s}–${e}`;
-    } catch { return null; }
-  }
 }
+
+
+
