@@ -789,14 +789,44 @@ function OrderModal(props) {
   const driver = order.accepted_by ? profilesById[order.accepted_by] : null;
   const customer = order.user_id ? profilesById[order.user_id] : null;
 
-  function formatEta(o){
-    try {
-      const opts = { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'Australia/Sydney' };
-      const s = new Date(o.eta_window_start).toLocaleTimeString('en-AU', opts);
-      const e = new Date(o.eta_window_end).toLocaleTimeString('en-AU', opts);
-      return `${s}–${e}`;
-    } catch { return null; }
+function formatEta(o) {
+  try {
+    const opts = { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'Australia/Sydney' };
+    const s = new Date(o.eta_window_start).toLocaleTimeString('en-AU', opts);
+    const e = new Date(o.eta_window_end).toLocaleTimeString('en-AU', opts);
+    return `${s}–${e}`;
+  } catch { 
+    return null; 
   }
+}
+
+// Take payment via Stripe Checkout (calls /api/pay on your Vercel app)
+async function takePayment(order) {
+  const amt = window.prompt('Enter amount to charge (AUD, e.g. 35.00):');
+  if (!amt) return;
+  const cents = Math.round(parseFloat(amt) * 100);
+  if (!Number.isFinite(cents) || cents < 100) {
+    window.alert('Enter a valid amount (min $1)');
+    return;
+  }
+
+  try {
+    const resp = await fetch('/api/pay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderId: order.id, amountCents: cents }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data?.url) {
+      window.alert('Payment init failed: ' + (data.error || 'unknown error'));
+      return;
+    }
+    window.location.href = data.url; // open Stripe Checkout
+  } catch (e) {
+    console.error(e);
+    window.alert('Network error creating payment');
+  }
+}
 
   return (
     <div
@@ -977,24 +1007,21 @@ function OrderModal(props) {
                 {order.status==='accepted' && (
                   <>
                     <button className="btn btn-warn" onClick={()=>updateOrderStatus(order.id,'item_purchased')}>Item Purchased</button>
+                    <button className="btn" onClick={()=>takePayment(order)}>Take Payment</button>
                     <EtaEditor order={order} onSet={(mins)=>setEta(order.id, mins)} />
                   </>
                 )}
                 {order.status==='item_purchased' && (
                   <>
                     <button className="btn btn-warn" onClick={()=>updateOrderStatus(order.id,'on_the_way')}>On the Way</button>
+                    <button className="btn" onClick={()=>takePayment(order)}>Take Payment</button>
                     <EtaEditor order={order} onSet={(mins)=>setEta(order.id, mins)} />
                   </>
                 )}
                 {order.status==='on_the_way' && (
                   <>
-                    <button
-                      className="btn btn-primary"
-                      onClick={()=>updateOrderStatus(order.id,'delivered')}
-                      title="Mark as delivered"
-                    >
-                      Mark Delivered
-                    </button>
+                    <button className="btn btn-primary" onClick={()=>updateOrderStatus(order.id,'delivered')}>Mark Delivered</button>
+                    <button className="btn" onClick={()=>takePayment(order)}>Take Payment</button>
                     <EtaEditor order={order} onSet={(mins)=>setEta(order.id, mins)} />
                   </>
                 )}
