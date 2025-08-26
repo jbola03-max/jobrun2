@@ -43,12 +43,118 @@ export default function App() {
   const [messagesByOrder, setMessagesByOrder] = useState({});
   const [draftByOrder, setDraftByOrder] = useState({});
   const [loadingMsgs, setLoadingMsgs] = useState({});
-  const [sending, setSending] = useState(false);
+
 
   // Time window
   const startOfTodayISO = useMemo(() => { const d = new Date(); d.setHours(0,0,0,0); return d.toISOString(); }, []);
   const ACTIVE = ['pending','accepted','item_purchased','on_the_way'];
+  // Helpers in component scope
 
+// prevents double-submit per orderId without adding UI state
+const sendingRef = useRef(new Set()); // Set<orderId>
+// avoid duplicate subscriptions in React Strict Mode
+const channelRef = useRef(null);
+
+useEffect(() => {
+  if (!openOrderId) return;
+
+  // clean up any previous channel before re-subscribing
+  if (channelRef.current) {
+    supabase.removeChannel(channelRef.current);
+    channelRef.current = null;
+  }
+
+  const channel = supabase
+    .channel(`messages-${openOrderId}`)
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'messages', filter: `order_id=eq.${openOrderId}` },
+      () => {
+        // refresh messages whenever this order’s rows change
+        loadMessages(openOrderId);
+      }
+    )
+    .subscribe();
+
+  channelRef.current = channel;
+
+  return () => {
+    if (channelRef.current) {
+      supabase.removeChannel(channelRef.current);
+      channelRef.current = null;
+    }
+  };
+}, [openOrderId]); // re-run when you open a different order
+
+async function openDetails(id, loader) {
+  setOpenOrderId(id);
+  await loader(id);
+}
+
+async function loadMessages(orderId) {
+  setLoadingMsgs(p => ({ ...p, [orderId]: true }));
+  const { data, error } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('order_id', orderId)
+    .order('created_at', { ascending: true });
+  setLoadingMsgs(p => ({ ...p, [orderId]: false }));
+  if (error) return toast('❌ ' + error.message);
+  setMessagesByOrder(p => ({ ...p, [orderId]: data || [] }));
+}
+
+/**
+ * Send a message for an order.
+ * If bodyOverride is provided, it is used directly (fixes stale-state issues).
+ */
+async function sendMessage(orderId, bodyOverride) {
+  const body = (bodyOverride ?? draftByOrder[orderId] ?? '').trim();
+  if (!body) return;
+
+  // prevent double-submit for this order
+  if (sendingRef.current.has(orderId)) return;
+  sendingRef.current.add(orderId);
+
+  try {
+    // ensure we have an authenticated user for RLS-friendly insert
+    const { data: { session } = {} } = await supabase.auth.getSession();
+    const uid = session?.user?.id;
+    if (!uid) {
+      toast('❌ Not authenticated');
+      return;
+    }
+
+    const { error } = await supabase
+      .from('messages')
+      .insert([{ order_id: orderId, sender_id: uid, body }]); // RLS-friendly
+
+    if (error) {
+      toast('❌ ' + error.message);
+      return;
+    }
+
+    // clear draft only if we were sending from the draft box
+    if (bodyOverride == null) {
+      setDraftByOrder(p => ({ ...p, [orderId]: '' }));
+    }
+
+    await loadMessages(orderId);
+  } finally {
+    // always clear the in-flight flag
+    sendingRef.current.delete(orderId);
+  }
+}
+
+async function quickSend(orderId, text) {
+  // don’t queue another if one is in-flight
+  if (sendingRef.current.has(orderId)) return;
+
+  // (optional) reflect in UI draft if you like:
+  setDraftByOrder(p => ({ ...p, [orderId]: text }));
+
+  // send using the override to avoid stale state
+  await sendMessage(orderId, text);
+}
   // Effects: auth
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => setSession(session));
@@ -577,114 +683,8 @@ export default function App() {
     </div>
   );
 
-  // Helpers in component scope
 
-// prevents double-submit per orderId without adding UI state
-const sendingRef = useRef(new Set()); // Set<orderId>
-// avoid duplicate subscriptions in React Strict Mode
-const channelRef = useRef(null);
-
-useEffect(() => {
-  if (!openOrderId) return;
-
-  // clean up any previous channel before re-subscribing
-  if (channelRef.current) {
-    supabase.removeChannel(channelRef.current);
-    channelRef.current = null;
-  }
-
-  const channel = supabase
-    .channel(`messages-${openOrderId}`)
-    .on(
-      'postgres_changes',
-      { event: '*', schema: 'public', table: 'messages', filter: `order_id=eq.${openOrderId}` },
-      () => {
-        // refresh messages whenever this order’s rows change
-        loadMessages(openOrderId);
-      }
-    )
-    .subscribe();
-
-  channelRef.current = channel;
-
-  return () => {
-    if (channelRef.current) {
-      supabase.removeChannel(channelRef.current);
-      channelRef.current = null;
-    }
-  };
-}, [openOrderId]); // re-run when you open a different order
-
-async function openDetails(id, loader) {
-  setOpenOrderId(id);
-  await loader(id);
 }
-
-async function loadMessages(orderId) {
-  setLoadingMsgs(p => ({ ...p, [orderId]: true }));
-  const { data, error } = await supabase
-    .from('messages')
-    .select('*')
-    .eq('order_id', orderId)
-    .order('created_at', { ascending: true });
-  setLoadingMsgs(p => ({ ...p, [orderId]: false }));
-  if (error) return toast('❌ ' + error.message);
-  setMessagesByOrder(p => ({ ...p, [orderId]: data || [] }));
-}
-
-/**
- * Send a message for an order.
- * If bodyOverride is provided, it is used directly (fixes stale-state issues).
- */
-async function sendMessage(orderId, bodyOverride) {
-  const body = (bodyOverride ?? draftByOrder[orderId] ?? '').trim();
-  if (!body) return;
-
-  // prevent double-submit for this order
-  if (sendingRef.current.has(orderId)) return;
-  sendingRef.current.add(orderId);
-
-  try {
-    // ensure we have an authenticated user for RLS-friendly insert
-    const { data: { session } = {} } = await supabase.auth.getSession();
-    const uid = session?.user?.id;
-    if (!uid) {
-      toast('❌ Not authenticated');
-      return;
-    }
-
-    const { error } = await supabase
-      .from('messages')
-      .insert([{ order_id: orderId, sender_id: uid, body }]); // RLS-friendly
-
-    if (error) {
-      toast('❌ ' + error.message);
-      return;
-    }
-
-    // clear draft only if we were sending from the draft box
-    if (bodyOverride == null) {
-      setDraftByOrder(p => ({ ...p, [orderId]: '' }));
-    }
-
-    await loadMessages(orderId);
-  } finally {
-    // always clear the in-flight flag
-    sendingRef.current.delete(orderId);
-  }
-}
-
-async function quickSend(orderId, text) {
-  // don’t queue another if one is in-flight
-  if (sendingRef.current.has(orderId)) return;
-
-  // (optional) reflect in UI draft if you like:
-  setDraftByOrder(p => ({ ...p, [orderId]: text }));
-
-  // send using the override to avoid stale state
-  await sendMessage(orderId, text);
-}
-
 /* ===== Small components ===== */
 
 function OrderTimeline({ status }) {
@@ -1070,6 +1070,7 @@ function OrderModal(props) {
     </div>
   );
 }
+
 
 
 
